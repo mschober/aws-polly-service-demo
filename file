@@ -1,0 +1,150 @@
+package com.egencia.checkout.listener;
+
+import com.egencia.checkout.client.site.model.insert.ProductEnum;
+import com.egencia.checkout.constants.DataFieldType;
+import com.egencia.checkout.constants.EventType;
+import com.egencia.checkout.constants.PaymentMeanType;
+import com.egencia.checkout.constants.ProductType;
+import com.egencia.checkout.listener.model.BackfillMessage;
+import com.egencia.checkout.manager.notification.AmqpMessageSender;
+import com.egencia.checkout.model.*;
+import com.egencia.checkout.utils.CheckoutUtils;
+import com.egencia.checkout.utils.RequirementUtils;
+import com.egencia.checkout.utils.TravelerUtils;
+import com.egencia.checkout.wrapper.NotificationWrapper;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.stereotype.Component;
+
+import javax.inject.Inject;
+import javax.validation.Valid;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.Optional;
+
+import static com.egencia.checkout.client.site.model.insert.MetaDossierState.APPROVED;
+import static com.egencia.checkout.client.site.model.insert.MetaDossierState.CANCELLED;
+import static com.egencia.checkout.client.site.model.insert.ProductEnum.AIR;
+import static com.egencia.checkout.client.site.model.insert.ProductEnum.TRAIN;
+import static com.egencia.checkout.constants.DataFieldType.PAYMENT_MEANS;
+import static com.egencia.checkout.manager.notification.constants.AMQPCustomConstants.ROUTE_BACKFILL;
+import static com.egencia.checkout.model.ActionType.CANCEL;
+import static com.egencia.checkout.utils.CheckoutUtils.getCostCenterId;
+import static com.egencia.checkout.utils.CheckoutUtils.getFirstTraveler;
+import static com.egencia.checkout.utils.CdfRequirementExtractor.getFreeFields;
+
+@Component
+public class AmqpBackfillConsumer extends AmqpInternalConsumer<BackfillMessage> {
+
+    @Inject
+    public AmqpBackfillConsumer(AmqpMessageSender amqpMessageSender,
+                                @Qualifier("amqpObjectMapper") ObjectMapper amqpObjectMapper,
+                                @Value("${amqp.external.exchange.name}") String externalExchangeName) {
+        this.amqpMessageSender = amqpMessageSender;
+        this.amqpObjectMapper = amqpObjectMapper;
+        this.externalExchangeName = externalExchangeName;
+    }
+
+    @Override
+    @RabbitListener(queues = "${amqp.internal.backfill.queue.name}")
+    public void handleMessage(@Payload @Valid final JsonNode jsonNode) {
+        super.handleMessage(jsonNode);
+    }
+
+    @Override
+    public BackfillMessage transformToTargetMessage(NotificationWrapper notificationWrapper, JsonNode jsonNode) throws JsonProcessingException {
+        Checkout checkout = notificationWrapper.getCheckout();
+        Booker booker = checkout.getBooker();
+        Traveler firstTraveler = getFirstTraveler(checkout);
+        String[] freeFields = getFreeFields(checkout.getRequirements());
+        FinalizationRequirement<?> selectedPaymentMean = getSelectedPaymentMean(checkout);
+        Transaction transaction = notificationWrapper.getTransactions().get(0);
+        ProductItem shoppedProductItem = notificationWrapper.getCheckout().getProductItems().get(0);
+
+        return new BackfillMessage.Builder()
+                .userId(firstTraveler.getUserId())
+                .bookerUserId(booker.getUserId())
+                .productId(shoppedProductItem.getId())
+                .pnr(transaction.getProductItems().get(0).getBookingReferences().get(0))
+                .product(flightProductOrTrain(transaction.getProductItems().get(0).getProductType()))
+                .paymentType(Objects.toString(PaymentMeanType.getPaymentMeanTypeByString(transaction.getPaymentType()), null))
+                .paymentLabel(transaction.getPaymentLabel())
+                .finalState(CANCEL == checkout.getActionType() ? CANCELLED : APPROVED)
+                .tripId(notificationWrapper.getTripId())
+                .exchange(transaction.getEventType() == EventType.CHANGE || transaction.getEventType() == EventType.CANCEL)
+                .title(firstTraveler.getCivility())
+                .firstname(firstTraveler.getFirstName())
+                .lastname(firstTraveler.getLastName())
+                .email(firstTraveler.getEmail())
+                .mobilePhoneNumber(TravelerUtils.getPhoneNumber(firstTraveler.getMobilePhone()))
+                .costCenter1(getCostCenterId(checkout, firstTraveler.getUserId(), DataFieldType.CC1))
+                .costCenter2(getCostCenterId(checkout, firstTraveler.getUserId(), DataFieldType.CC2))
+                .costCenter3(firstTraveler.getEmployeeId())
+                .freeField1(freeFields[0])
+                .freeField2(freeFields[1])
+                .freeField3(freeFields[2])
+                .agentCode(booker.getAgentCode())
+                .cardToken(computePaymentValue(selectedPaymentMean, DataFieldType.CREDIT_CARD_TOKEN.getName()))
+                .vNettPaymentId(computeVnettPaymentId(checkout, shoppedProductItem))
+                .eNettTransactionId(computeVnettTransactionId(checkout, shoppedProductItem))
+                .build();
+    }
+
+    private String computeVnettPaymentId(Checkout checkout, ProductItem shoppedProductItem) {
+        Optional<SupplierFOP> supplierFOPForProduct = CheckoutUtils.getSupplierFOPForProduct(checkout, shoppedProductItem.getProductType(), shoppedProductItem.getId());
+        if(supplierFOPForProduct.isPresent()){
+            return supplierFOPForProduct.get().getVnettPaymentId();
+        }
+        return null;
+    }
+
+    private String computeVnettTransactionId(Checkout checkout, ProductItem shoppedProductItem) {
+        Optional<SupplierFOP> supplierFOPForProduct = CheckoutUtils.getSupplierFOPForProduct(checkout, shoppedProductItem.getProductType(), shoppedProductItem.getId());
+        if(supplierFOPForProduct.isPresent()){
+            return supplierFOPForProduct.get().getVnettTransactionId();
+        }
+        return null;
+    }
+
+    FinalizationRequirement<?> getSelectedPaymentMean(Checkout checkout) {
+        return checkout.getRequirements().stream()
+                .filter(req -> req.getType() == PAYMENT_MEANS && req.getProductType() == CheckoutUtils.getProductTypeOfFirstProductItem(checkout))
+                .findFirst().orElse(new FinalizationRequirement<>())
+                .getChildrenRequirements()
+                .stream().filter(FinalizationRequirement::isSelected).findFirst().orElse(new FinalizationRequirement<>());
+    }
+
+
+    private ProductEnum flightProductOrTrain(ProductType productType) {
+        if (productType == ProductType.FLIGHT) {
+            return AIR;
+        }
+        return TRAIN;
+    }
+
+    protected String computePaymentValue(FinalizationRequirement<?> selectedPaymentMean, String dataFieldType) {
+        if (selectedPaymentMean == null) {
+            return null;
+        }
+        final FinalizationRequirement<?> dataFieldRequirement = RequirementUtils.getChildRequirementOfType(selectedPaymentMean, dataFieldType);
+        return RequirementUtils.getValue(dataFieldRequirement, String.class);
+    }
+
+    protected String computePaymentValueFromParentType(FinalizationRequirement<?> selectedPaymentMean, String parentFiled, String childField) {
+        if (selectedPaymentMean == null) {
+            return null;
+        }
+        final FinalizationRequirement<?> childFieldRequirement = RequirementUtils.getChildRequirementOfType(Collections.singletonList(selectedPaymentMean), parentFiled, childField);
+        return RequirementUtils.getValue(childFieldRequirement, String.class);
+    }
+
+    @Override
+    public String getTargetRoutingKey() {
+        return ROUTE_BACKFILL;
+    }
+}

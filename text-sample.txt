@@ -1,0 +1,12 @@
+Deck-Building Games
+Deck-Building Games (DBGs) are similar to Trading Card Games (TCGs)
+where each player has a deck of cards they use during play. The
+difference is that in DBGs the players all work from the same card
+collection, and the deck-building occurs as part of the game. These
+games usually come with 15-20 different card types, but only ten are
+used in a single game. This gives the games a lot of replay value. In
+these games players build their deck over time by purchasing available
+cards from the pool of cards. Games like this usually end when a certain
+number of card types are depleted, or when a specific situation occurs.
+
+Examples: Dominion, Thunderstone, Nightfall, and Quarriors
